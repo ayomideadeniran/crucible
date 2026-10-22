@@ -2,12 +2,10 @@
 //!
 //! Provides three endpoints:
 //!
-//! - `GET /health/live`  — liveness probe: returns 200 if the process is running.
-//! - `GET /health/ready` — readiness probe: returns 200 only when PostgreSQL,
-//!   Redis, worker queue, and Soroban RPC are reachable; returns 503 otherwise.
 //! - `GET /health/live`    — liveness probe: returns 200 if the process is running.
-//! - `GET /health/ready`   — readiness probe: returns 200 only when PostgreSQL,
-//!   Redis, and the worker queue are reachable; returns 503 otherwise.
+//! - `GET /health/ready`   — readiness probe: returns 200 only when PostgreSQL
+//!   accepts writes, and Redis, the worker queue, and Soroban RPC are
+//!   reachable; returns 503 otherwise.
 //! - `GET /health/startup` — startup probe: returns 503 until full startup is
 //!   complete (migrations, Redis, workers), then returns 200 permanently.
 //!
@@ -18,7 +16,6 @@
 
 use std::time::Duration;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
-use redis::aio::ConnectionManager;
 use serde::Serialize;
 use sqlx::PgPool;
 use tokio::time::timeout;
@@ -36,8 +33,10 @@ static STARTUP_COMPLETE: AtomicBool = AtomicBool::new(false);
 #[derive(Clone)]
 pub struct HealthState {
     pub db: PgPool,
-    pub cache: ConnectionManager,
-    pub queue: ConnectionManager,
+    /// Client, not a live connection: each probe opens its own connection so
+    /// the router can be built synchronously and a stale connection cannot
+    /// mask a Redis outage.
+    pub redis: redis::Client,
     pub soroban_rpc_url: Option<String>,
 }
 
@@ -100,9 +99,10 @@ impl HealthChecker {
     /// Execute health pings across all dependencies with quick timeout bounds.
     pub async fn run_checks(state: &HealthState) -> (bool, HealthReport) {
         let database = Self::check_database_with_timeout(&state.db).await;
-        let redis = Self::check_cache_with_timeout(&state.cache).await;
-        let queue = Self::check_queue_with_timeout(&state.queue).await;
-        let soroban_rpc = Self::check_soroban_rpc_with_timeout(state.soroban_rpc_url.as_deref()).await;
+        let redis = Self::check_cache_with_timeout(&state.redis).await;
+        let queue = Self::check_queue_with_timeout(&state.redis).await;
+        let soroban_rpc =
+            Self::check_soroban_rpc_with_timeout(state.soroban_rpc_url.as_deref()).await;
 
         let all_healthy = database.status == "up"
             && redis.status == "up"
@@ -137,8 +137,8 @@ impl HealthChecker {
         }
     }
 
-    pub async fn check_cache_with_timeout(conn: &ConnectionManager) -> CheckResult {
-        match timeout(HEALTH_CHECK_TIMEOUT, check_cache(conn)).await {
+    pub async fn check_cache_with_timeout(client: &redis::Client) -> CheckResult {
+        match timeout(HEALTH_CHECK_TIMEOUT, check_cache(client)).await {
             Ok(result) => result,
             Err(_) => CheckResult {
                 status: "down",
@@ -147,8 +147,8 @@ impl HealthChecker {
         }
     }
 
-    pub async fn check_queue_with_timeout(conn: &ConnectionManager) -> CheckResult {
-        match timeout(HEALTH_CHECK_TIMEOUT, check_queue(conn)).await {
+    pub async fn check_queue_with_timeout(client: &redis::Client) -> CheckResult {
+        match timeout(HEALTH_CHECK_TIMEOUT, check_queue(client)).await {
             Ok(result) => result,
             Err(_) => CheckResult {
                 status: "down",
@@ -266,8 +266,8 @@ pub async fn startup(State(state): State<HealthState>) -> impl IntoResponse {
 
     // Check if all dependencies are available
     let database = check_database(&state.db).await;
-    let redis = check_cache(&state.cache).await;
-    let queue = check_queue(&state.queue).await;
+    let redis = check_cache(&state.redis).await;
+    let queue = check_queue(&state.redis).await;
 
     let all_ready = database.status == "up" && redis.status == "up" && queue.status == "up";
 
@@ -339,30 +339,73 @@ pub fn reset_startup_flag() {
 // Dependency checks
 // ---------------------------------------------------------------------------
 
+/// Verifies that PostgreSQL accepts writes instead of just answering reads.
+///
+/// A plain `SELECT 1` succeeds on a read-only standby or when the WAL volume
+/// is full, so the pod would be marked ready while every write would fail.
+/// The probe inserts and updates a dedicated row inside a transaction that is
+/// always rolled back, which exercises write permissions and WAL without
+/// keeping any state.
 async fn check_database(pool: &PgPool) -> CheckResult {
-    match sqlx::query_scalar::<_, i32>("SELECT 1")
-        .fetch_one(pool)
-        .await
-    {
-        Ok(_) => {
-            debug!("Database health check passed");
-            CheckResult {
-                status: "up",
-                message: None,
-            }
-        }
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
         Err(e) => {
-            warn!("Database health check failed: {e}");
-            CheckResult {
+            warn!("Database health check could not acquire a connection: {e}");
+            return CheckResult {
                 status: "down",
                 message: Some("connection unavailable".into()),
-            }
+            };
         }
+    };
+
+    let write = sqlx::query(
+        r#"
+        INSERT INTO db_write_probe (id, last_write_at)
+        VALUES (1, NOW())
+        ON CONFLICT (id) DO UPDATE SET last_write_at = EXCLUDED.last_write_at
+        "#,
+    )
+    .execute(&mut *tx)
+    .await;
+    // Roll back unconditionally so the probe never leaves state behind. The
+    // write still emits WAL, which is what detects a full WAL volume, and the
+    // abort itself flushes WAL on synchronous_commit.
+    let rollback = tx.rollback().await;
+
+    if let Err(e) = write {
+        warn!("Database write health check failed: {e}");
+        return CheckResult {
+            status: "down",
+            message: Some("database is not writable".into()),
+        };
+    }
+    if let Err(e) = rollback {
+        warn!("Database write health check could not roll back: {e}");
+        return CheckResult {
+            status: "down",
+            message: Some("database is not writable".into()),
+        };
+    }
+
+    debug!("Database write health check passed");
+    CheckResult {
+        status: "up",
+        message: None,
     }
 }
 
-async fn check_cache(conn: &ConnectionManager) -> CheckResult {
-    let mut conn = conn.clone();
+async fn check_cache(client: &redis::Client) -> CheckResult {
+    let mut conn = match client.get_multiplexed_async_connection().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            warn!("Redis health check failed: {e}");
+            return CheckResult {
+                status: "down",
+                message: Some("connection unavailable".into()),
+            };
+        }
+    };
+
     match redis::cmd("PING").query_async::<String>(&mut conn).await {
         Ok(_) => {
             debug!("Redis health check passed");
@@ -381,12 +424,19 @@ async fn check_cache(conn: &ConnectionManager) -> CheckResult {
     }
 }
 
-async fn check_queue(conn: &ConnectionManager) -> CheckResult {
-    let mut conn = conn.clone();
+async fn check_queue(client: &redis::Client) -> CheckResult {
+    let mut conn = match client.get_multiplexed_async_connection().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            warn!("Queue backend connection failed: {e}");
+            return CheckResult {
+                status: "down",
+                message: Some("connection unavailable".into()),
+            };
+        }
+    };
 
-    let ping = redis::cmd("PING")
-        .query_async::<String>(&mut conn)
-        .await;
+    let ping = redis::cmd("PING").query_async::<String>(&mut conn).await;
     match ping {
         Ok(_) => debug!("Queue backend connection is healthy"),
         Err(e) => {
@@ -413,7 +463,7 @@ async fn check_queue(conn: &ConnectionManager) -> CheckResult {
     }
 }
 
-async fn has_registered_workers(conn: &mut ConnectionManager) -> bool {
+async fn has_registered_workers(conn: &mut redis::aio::MultiplexedConnection) -> bool {
     match redis::cmd("KEYS")
         .arg("*:consumers")
         .query_async::<Vec<String>>(conn)
@@ -421,11 +471,7 @@ async fn has_registered_workers(conn: &mut ConnectionManager) -> bool {
     {
         Ok(keys) if !keys.is_empty() => {
             for key in &keys {
-                if let Ok(count) = redis::cmd("SCARD")
-                    .arg(key)
-                    .query_async::<i32>(conn)
-                    .await
-                {
+                if let Ok(count) = redis::cmd("SCARD").arg(key).query_async::<i32>(conn).await {
                     if count > 0 {
                         return true;
                     }

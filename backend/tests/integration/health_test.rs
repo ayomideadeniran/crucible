@@ -8,8 +8,7 @@ use axum::{
     http::{Request, StatusCode},
     Router,
 };
-use backend::api::handlers::health::{self, HealthState, LivenessResponse};
-use redis::aio::ConnectionManager;
+use backend::api::handlers::health::{self, HealthState};
 use redis::AsyncCommands;
 use redis::Client as RedisClient;
 use sqlx::postgres::PgPoolOptions;
@@ -39,27 +38,22 @@ fn dead_pool() -> PgPool {
         .expect("dead_pool")
 }
 
-/// A [`ConnectionManager`] backed by a real Redis instance.
-async fn live_redis() -> ConnectionManager {
+/// A Redis client for a live local instance.
+fn live_redis() -> RedisClient {
     let url = std::env::var("REDIS_URL")
         .or_else(|_| std::env::var("TEST_REDIS_URL"))
         .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
-    let client = RedisClient::open(url).expect("live_redis client");
-    ConnectionManager::new(client)
-        .await
-        .expect("live_redis connection")
+    RedisClient::open(url).expect("live_redis client")
 }
 
-/// Attempt to create a [`ConnectionManager`] that will fail I/O.  Returns
-/// `None` when the connection is refused immediately at construction time.
-async fn dead_redis() -> Option<ConnectionManager> {
-    let client = RedisClient::open("redis://127.0.0.1:1/").expect("dead_redis client");
-    ConnectionManager::new(client).await.ok()
+/// A Redis client whose connections are always refused.
+fn dead_redis() -> RedisClient {
+    RedisClient::open("redis://127.0.0.1:1/").expect("dead_redis client")
 }
 
 /// Register a synthetic worker heartbeat so the queue-probe sees an active
 /// worker and reports "up".
-async fn register_worker_hb(conn: &mut ConnectionManager) {
+async fn register_worker_hb(client: &RedisClient) {
     let payload = serde_json::json!({
         "worker_id": "health-test-worker",
         "last_heartbeat": 0,
@@ -68,6 +62,10 @@ async fn register_worker_hb(conn: &mut ConnectionManager) {
         "uptime_seconds": 0,
     })
     .to_string();
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("register_worker_hb connection");
     let _: () = conn
         .set("worker:health-test-worker:health", &payload)
         .await
@@ -75,8 +73,10 @@ async fn register_worker_hb(conn: &mut ConnectionManager) {
 }
 
 /// Remove the synthetic worker heartbeat.
-async fn remove_worker_hb(conn: &mut ConnectionManager) {
-    let _: Result<(), _> = conn.del("worker:health-test-worker:health").await;
+async fn remove_worker_hb(client: &RedisClient) {
+    if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
+        let _: Result<(), _> = conn.del("worker:health-test-worker:health").await;
+    }
 }
 
 /// Parse the response body into a JSON value.
@@ -112,16 +112,14 @@ async fn liveness_returns_200() {
 #[tokio::test]
 async fn readiness_all_healthy() {
     let db = live_pool();
-    let cache = live_redis().await;
-    let mut queue = cache.clone();
+    let redis = live_redis();
 
     // Register a worker heartbeat so the queue check passes
-    register_worker_hb(&mut queue).await;
+    register_worker_hb(&redis).await;
 
     let state = HealthState {
         db,
-        cache,
-        queue,
+        redis: redis.clone(),
         soroban_rpc_url: None,
     };
 
@@ -145,8 +143,7 @@ async fn readiness_all_healthy() {
     assert!(json["version"].is_string());
 
     // Cleanup — remove the synthetic heartbeat
-    let mut cleanup = live_redis().await;
-    remove_worker_hb(&mut cleanup).await;
+    remove_worker_hb(&redis).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -155,13 +152,9 @@ async fn readiness_all_healthy() {
 
 #[tokio::test]
 async fn readiness_db_unavailable() {
-    let cache = live_redis().await;
-    let queue = cache.clone();
-
     let state = HealthState {
         db: dead_pool(),
-        cache,
-        queue,
+        redis: live_redis(),
         soroban_rpc_url: None,
     };
 
@@ -193,16 +186,11 @@ async fn readiness_db_unavailable() {
 #[tokio::test]
 async fn readiness_queue_unavailable() {
     let db = live_pool();
-    let cache = live_redis().await;
-    // Re-use the same Redis — no worker heartbeat or Apalis consumer set
-    // exists in the test namespace, so the queue probe will correctly
-    // report "down".
-    let queue = cache.clone();
-
+    // No worker heartbeat or Apalis consumer exists in the test namespace,
+    // so the queue probe will correctly report "down".
     let state = HealthState {
         db,
-        cache,
-        queue,
+        redis: live_redis(),
         soroban_rpc_url: None,
     };
 
@@ -230,32 +218,9 @@ async fn readiness_queue_unavailable() {
 
 #[tokio::test]
 async fn readiness_redis_unavailable() {
-    let some_redis = dead_redis().await;
-
-    let (cache, queue) = match some_redis {
-        Some(conn) => {
-            // Connection was established lazily — the PING will fail later.
-            (conn.clone(), conn)
-        }
-        None => {
-            // Connection was refused at construction time, so we cannot build
-            // a HealthState.  The check functions handle this internally; the
-            // degraded-response schema is verified via the unit tests in
-            // health.rs and the other integration tests in this file.
-            eprintln!(
-                "⚠  Skipping full Redis-down integration test — \
-                 port 1 refused connection immediately.  \
-                 The degraded-response schema is verified via the unit tests \
-                 in health.rs."
-            );
-            return;
-        }
-    };
-
     let state = HealthState {
         db: live_pool(),
-        cache,
-        queue,
+        redis: dead_redis(),
         soroban_rpc_url: None,
     };
 
@@ -285,11 +250,9 @@ async fn readiness_redis_unavailable() {
 
 #[tokio::test]
 async fn liveness_stays_healthy_when_deps_are_down() {
-    let cache = live_redis().await;
     let state = HealthState {
         db: dead_pool(),
-        cache: cache.clone(),
-        queue: cache,
+        redis: live_redis(),
         soroban_rpc_url: None,
     };
 

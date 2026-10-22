@@ -23,7 +23,7 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::{
     api::handlers::{
         admin, alerts, contracts as contract_handlers, coverage, dashboard,
-        dashboard::get_dashboard, errors, profiling, sandbox, stellar, ws::ws_dashboard_handler,
+        dashboard::get_dashboard, errors, health, profiling, sandbox, stellar, ws::ws_dashboard_handler,
     },
     api::middleware::{
         content_type::require_json_content_type,
@@ -93,6 +93,12 @@ pub fn build_router(
 
     let dlq_coordinator = Arc::new(crate::workers::retry::DlqCoordinator::new(Arc::new(redis_client.clone())));
 
+    let health_state = health::HealthState {
+        db: db_pool.clone(),
+        redis: redis_client.clone(),
+        soroban_rpc_url: None,
+    };
+
     let contracts_router = Router::new()
         .route("/compile", post(contract_handlers::compile_contract))
         .route(
@@ -124,6 +130,7 @@ pub fn build_router(
 
     Router::new()
         .route("/", get(|| async { "Crucible Backend API" }))
+        .nest("/health", health::router().with_state(health_state))
         .route("/metrics", get(profiling::get_prometheus_metrics))
         .route("/.well-known/stellar.toml", get(stellar::get_stellar_toml))
         .route("/api/stellar/faucet", post(stellar::fund_testnet_account))

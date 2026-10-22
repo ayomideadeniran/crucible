@@ -132,16 +132,6 @@ async fn main() -> Result<(), anyhow::Error> {
         .backend(storage)
         .build_fn(monitor_transaction);
 
-    let health_cache = backend::db::redis::connect_with_retry(&redis_client, &config.redis).await?;
-    let health_queue = backend::db::redis::connect_with_retry(&redis_client, &config.redis).await?;
-
-    let health_state = backend::api::handlers::health::HealthState {
-        db: db_pool.clone(),
-        cache: health_cache,
-        queue: health_queue,
-        soroban_rpc_url: None,
-    };
-
     let shared_services = SharedServices {
         metrics_exporter,
         error_manager,
