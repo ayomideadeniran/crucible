@@ -300,7 +300,7 @@ async fn send_webhook_request(
     url: &Url,
     headers: &HashMap<String, String>,
     body: &str,
-) -> Result<(u16, bool, Option<String>), reqwest::Error> {
+) -> anyhow::Result<(u16, bool, Option<String>)> {
     let mut request = client.post(url.as_str()).body(body.to_owned());
     for (name, value) in headers {
         request = request.header(name, value);
