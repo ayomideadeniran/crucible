@@ -3,10 +3,10 @@
 //! This module implements a robust cache invalidation system that works with Redis
 //! to ensure data consistency between the database and cache layers.
 
-use std::collections::HashMap;
-use serde::{Serialize, Deserialize};
-use std::sync::Arc;
 use redis::AsyncCommands;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
@@ -74,21 +74,87 @@ impl Default for CacheInvalidationConfig {
     }
 }
 
+/// Number of keys fetched per `SCAN` page when invalidating by pattern.
+///
+/// `SCAN`'s `COUNT` is only a hint of the work done per call: it samples the
+/// keyspace and yields between iterations instead of blocking the
+/// single-threaded Redis event loop for the whole keyspace like `KEYS` does.
+const SCAN_PAGE_SIZE: usize = 500;
+
+/// Fetches a single page of keys matching `pattern`, starting at `cursor`.
+///
+/// Returns the cursor to continue scanning with (`0` marks the end of the
+/// iteration) together with the keys found in this page.
+async fn scan_page(
+    conn: &mut redis::aio::MultiplexedConnection,
+    cursor: u64,
+    pattern: &str,
+) -> Result<(u64, Vec<String>), redis::RedisError> {
+    redis::cmd("SCAN")
+        .arg(cursor)
+        .arg("MATCH")
+        .arg(pattern)
+        .arg("COUNT")
+        .arg(SCAN_PAGE_SIZE)
+        .query_async(conn)
+        .await
+}
+
+/// Deletes `keys` in a single pipelined round trip.
+async fn delete_keys(
+    conn: &mut redis::aio::MultiplexedConnection,
+    keys: &[String],
+) -> Result<(), redis::RedisError> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let mut pipe = redis::pipe();
+    for key in keys {
+        pipe.del(key);
+    }
+    let _: () = pipe.query_async(conn).await?;
+    Ok(())
+}
+
+/// Deletes every key matching `pattern`, page by page, and returns how many
+/// keys were deleted.
+///
+/// Keys are deleted per `SCAN` page so that neither the Redis keyspace walk
+/// nor the client-side key buffer grows unbounded on large caches.
+async fn scan_and_delete(
+    conn: &mut redis::aio::MultiplexedConnection,
+    pattern: &str,
+) -> Result<u64, redis::RedisError> {
+    let mut cursor: u64 = 0;
+    let mut deleted: u64 = 0;
+    loop {
+        let (next_cursor, page) = scan_page(conn, cursor, pattern).await?;
+        if !page.is_empty() {
+            delete_keys(conn, &page).await?;
+            deleted += page.len() as u64;
+        }
+        if next_cursor == 0 {
+            return Ok(deleted);
+        }
+        cursor = next_cursor;
+    }
+}
+
 impl CacheInvalidationManager {
     /// Create a new cache invalidation manager
     pub fn new(redis_client: Arc<redis::Client>, config: CacheInvalidationConfig) -> Self {
         let (tx, mut rx) = mpsc::channel::<CacheInvalidationEvent>(100);
-        
+
         // Start background processor if enabled
         if config.background_processing {
             let client = redis_client.clone();
             let config_clone = config.clone();
-            
+
             tokio::spawn(async move {
                 Self::background_processor(client, rx, config_clone).await;
             });
         }
-        
+
         Self {
             redis_client,
             tx,
@@ -97,7 +163,10 @@ impl CacheInvalidationManager {
     }
 
     /// Enqueue an invalidation event
-    pub async fn enqueue_invalidation(&self, event: CacheInvalidationEvent) -> Result<(), anyhow::Error> {
+    pub async fn enqueue_invalidation(
+        &self,
+        event: CacheInvalidationEvent,
+    ) -> Result<(), anyhow::Error> {
         self.tx.send(event).await.map_err(|e| {
             error!(error = ?e, "Failed to send invalidation event");
             anyhow::anyhow!("Failed to send invalidation event: {}", e)
@@ -107,34 +176,33 @@ impl CacheInvalidationManager {
     /// Invalidate specific cache keys synchronously
     pub async fn invalidate_keys(&self, keys: Vec<String>) -> Result<(), anyhow::Error> {
         let mut conn = self.redis_client.get_multiplexed_async_connection().await?;
-        
+
         // Use pipelining for better performance
         let mut pipe = redis::pipe();
         for key in &keys {
             pipe.del(key);
         }
-        
+
         let _: () = pipe.query_async(&mut conn).await?;
-        
+
         info!(count = keys.len(), "Invalidated cache keys");
         Ok(())
     }
 
     /// Invalidate keys matching a pattern
+    ///
+    /// Matching keys are discovered with cursor-based `SCAN` iteration and
+    /// deleted page by page. `KEYS` is deliberately avoided: it walks the
+    /// whole keyspace in one blocking call on the single-threaded Redis event
+    /// loop, causing severe latency spikes for all other clients.
     pub async fn invalidate_pattern(&self, pattern: &str) -> Result<(), anyhow::Error> {
         let mut conn = self.redis_client.get_multiplexed_async_connection().await?;
-        
-        // Get all keys matching the pattern
-        let keys: Vec<String> = redis::cmd("KEYS")
-            .arg(pattern)
-            .query_async(&mut conn)
-            .await?;
-        
-        if !keys.is_empty() {
-            self.invalidate_keys(keys.clone()).await?;
-            info!(pattern = %pattern, count = keys.len(), "Invalidated keys by pattern");
+        let deleted = scan_and_delete(&mut conn, pattern).await?;
+
+        if deleted > 0 {
+            info!(pattern = %pattern, count = deleted, "Invalidated keys by pattern");
         }
-        
+
         Ok(())
     }
 
@@ -147,18 +215,18 @@ impl CacheInvalidationManager {
     /// Invalidate keys by tag (using Redis sets)
     pub async fn invalidate_by_tag(&self, tag: &str) -> Result<(), anyhow::Error> {
         let mut conn = self.redis_client.get_multiplexed_async_connection().await?;
-        
+
         // Get all keys associated with this tag
         let keys: Vec<String> = redis::cmd("SMEMBERS")
             .arg(format!("cache:tags:{}", tag))
             .query_async(&mut conn)
             .await?;
-        
+
         if !keys.is_empty() {
             self.invalidate_keys(keys.clone()).await?;
             info!(tag = %tag, count = keys.len(), "Invalidated keys by tag");
         }
-        
+
         Ok(())
     }
 
@@ -169,10 +237,10 @@ impl CacheInvalidationManager {
         config: CacheInvalidationConfig,
     ) {
         info!("Starting cache invalidation background processor");
-        
+
         while let Some(event) = rx.recv().await {
             debug!(strategy = ?event.strategy, targets_count = event.targets.len(), "Processing invalidation event");
-            
+
             let result = match event.strategy {
                 InvalidationStrategy::Key => {
                     Self::process_key_invalidation(&redis_client, &event.targets, &config).await
@@ -181,13 +249,14 @@ impl CacheInvalidationManager {
                     Self::process_pattern_invalidation(&redis_client, &event.targets, &config).await
                 }
                 InvalidationStrategy::Namespace => {
-                    Self::process_namespace_invalidation(&redis_client, &event.targets, &config).await
+                    Self::process_namespace_invalidation(&redis_client, &event.targets, &config)
+                        .await
                 }
                 InvalidationStrategy::Tag => {
                     Self::process_tag_invalidation(&redis_client, &event.targets, &config).await
                 }
             };
-            
+
             if let Err(e) = result {
                 error!(error = ?e, "Failed to process invalidation event");
             }
@@ -208,8 +277,9 @@ impl CacheInvalidationManager {
                     if attempts >= config.retry_attempts {
                         return Err(e);
                     }
-                    
-                    tokio::time::sleep(std::time::Duration::from_millis(config.retry_delay_ms)).await;
+
+                    tokio::time::sleep(std::time::Duration::from_millis(config.retry_delay_ms))
+                        .await;
                 }
             }
         }
@@ -229,8 +299,9 @@ impl CacheInvalidationManager {
                     if attempts >= config.retry_attempts {
                         return Err(e);
                     }
-                    
-                    tokio::time::sleep(std::time::Duration::from_millis(config.retry_delay_ms)).await;
+
+                    tokio::time::sleep(std::time::Duration::from_millis(config.retry_delay_ms))
+                        .await;
                 }
             }
         }
@@ -250,8 +321,9 @@ impl CacheInvalidationManager {
                     if attempts >= config.retry_attempts {
                         return Err(e);
                     }
-                    
-                    tokio::time::sleep(std::time::Duration::from_millis(config.retry_delay_ms)).await;
+
+                    tokio::time::sleep(std::time::Duration::from_millis(config.retry_delay_ms))
+                        .await;
                 }
             }
         }
@@ -271,8 +343,9 @@ impl CacheInvalidationManager {
                     if attempts >= config.retry_attempts {
                         return Err(e);
                     }
-                    
-                    tokio::time::sleep(std::time::Duration::from_millis(config.retry_delay_ms)).await;
+
+                    tokio::time::sleep(std::time::Duration::from_millis(config.retry_delay_ms))
+                        .await;
                 }
             }
         }
@@ -283,13 +356,13 @@ impl CacheInvalidationManager {
         keys: Vec<String>,
     ) -> Result<(), anyhow::Error> {
         let mut conn = redis_client.get_multiplexed_async_connection().await?;
-        
+
         // Use pipelining for better performance
         let mut pipe = redis::pipe();
         for key in &keys {
             pipe.del(key);
         }
-        
+
         let _: () = pipe.query_async(&mut conn).await?;
         Ok(())
     }
@@ -300,16 +373,7 @@ impl CacheInvalidationManager {
     ) -> Result<(), anyhow::Error> {
         for pattern in &patterns {
             let mut conn = redis_client.get_multiplexed_async_connection().await?;
-            
-            // Get all keys matching the pattern
-            let keys: Vec<String> = redis::cmd("KEYS")
-                .arg(pattern)
-                .query_async(&mut conn)
-                .await?;
-            
-            if !keys.is_empty() {
-                Self::invalidate_keys_impl(redis_client, keys).await?;
-            }
+            scan_and_delete(&mut conn, pattern).await?;
         }
         Ok(())
     }
@@ -331,7 +395,7 @@ impl CacheInvalidationManager {
     ) -> Result<(), anyhow::Error> {
         for tag in &tags {
             let mut conn = redis_client.get_multiplexed_async_connection().await?;
-            
+
             // Get all keys associated with this tag
             let keys: Vec<String> = redis::cmd("SMEMBERS")
                 .arg(format!("cache:tags:{}", tag))
@@ -361,7 +425,12 @@ pub struct SimulationCacheKey {
 }
 
 impl SimulationCacheKey {
-    pub fn new(contract_id: impl Into<String>, function: impl Into<String>, args_hash: impl Into<String>, ledger_sequence: u64) -> Self {
+    pub fn new(
+        contract_id: impl Into<String>,
+        function: impl Into<String>,
+        args_hash: impl Into<String>,
+        ledger_sequence: u64,
+    ) -> Self {
         Self {
             contract_id: contract_id.into(),
             function: function.into(),
@@ -371,7 +440,10 @@ impl SimulationCacheKey {
     }
 
     pub fn to_redis_key(&self) -> String {
-        format!("sim:{}:{}:{}:{}", self.contract_id, self.function, self.args_hash, self.ledger_sequence)
+        format!(
+            "sim:{}:{}:{}:{}",
+            self.contract_id, self.function, self.args_hash, self.ledger_sequence
+        )
     }
 }
 
@@ -433,7 +505,9 @@ impl SimulationCacheManager {
 
     pub async fn insert(&self, key: &SimulationCacheKey, result: SimulationResult) {
         let redis_key = key.to_redis_key();
-        self.moka_cache.insert(redis_key.clone(), result.clone()).await;
+        self.moka_cache
+            .insert(redis_key.clone(), result.clone())
+            .await;
 
         if let Ok(mut conn) = self.redis_client.get_multiplexed_async_connection().await {
             if let Ok(json) = serde_json::to_string(&result) {
@@ -443,19 +517,32 @@ impl SimulationCacheManager {
     }
 
     /// Invalidate simulation cache entries when a ledger modifies the target contract footprint.
-    pub async fn invalidate_contract_footprint(&self, contract_id: &str) -> Result<(), anyhow::Error> {
+    ///
+    /// Matching keys are discovered with cursor-based `SCAN` iteration; each
+    /// page is invalidated from the L1 Moka cache and deleted from Redis as
+    /// it is discovered, so neither layer buffers the full keyset.
+    pub async fn invalidate_contract_footprint(
+        &self,
+        contract_id: &str,
+    ) -> Result<(), anyhow::Error> {
         info!(contract_id = %contract_id, "Invalidating simulation cache for updated contract footprint");
-        
+
         let pattern = format!("sim:{}*", contract_id);
         let mut conn = self.redis_client.get_multiplexed_async_connection().await?;
-        let keys: Vec<String> = redis::cmd("KEYS").arg(&pattern).query_async(&mut conn).await?;
 
-        for key in &keys {
-            self.moka_cache.invalidate(key).await;
-        }
-
-        if !keys.is_empty() {
-            redis::cmd("DEL").arg(&keys).query_async::<()>(&mut conn).await?;
+        let mut cursor: u64 = 0;
+        loop {
+            let (next_cursor, page) = scan_page(&mut conn, cursor, &pattern).await?;
+            if !page.is_empty() {
+                for key in &page {
+                    self.moka_cache.invalidate(key).await;
+                }
+                delete_keys(&mut conn, &page).await?;
+            }
+            if next_cursor == 0 {
+                break;
+            }
+            cursor = next_cursor;
         }
 
         Ok(())
@@ -477,12 +564,13 @@ mod tests {
     async fn test_cache_invalidation_manager_creation() {
         // Test that manager can be created
         let client = redis::Client::open("redis://127.0.0.1/").unwrap();
-        let manager = CacheInvalidationManager::new(Arc::new(client), CacheInvalidationConfig::default());
-        
+        let manager =
+            CacheInvalidationManager::new(Arc::new(client), CacheInvalidationConfig::default());
+
         assert!(manager.config.background_processing);
         assert_eq!(manager.config.max_concurrent, 10);
     }
-    
+
     #[tokio::test]
     async fn test_invalidation_strategy_enum() {
         assert_eq!(InvalidationStrategy::Key as i32, 0);
@@ -492,9 +580,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_invalidate_pattern_returns_error_when_redis_unreachable() {
+        // Point at a closed port so connection setup fails immediately. The
+        // SCAN-based invalidation must surface the error instead of hanging.
+        let client = Arc::new(redis::Client::open("redis://127.0.0.1:1/").unwrap());
+        let manager = CacheInvalidationManager::new(
+            client,
+            CacheInvalidationConfig {
+                background_processing: false,
+                ..Default::default()
+            },
+        );
+
+        let result = manager.invalidate_pattern("unreachable:*").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_pattern_deletes_only_matching_keys() {
+        let client = Arc::new(redis::Client::open("redis://127.0.0.1/").unwrap());
+        let mut conn = match client.get_multiplexed_async_connection().await {
+            Ok(conn) => conn,
+            Err(_) => return, // no local Redis available; nothing to verify
+        };
+
+        let mut seed = redis::pipe();
+        seed.set("crucible_scan_test:one", 1);
+        seed.set("crucible_scan_test:two", 2);
+        seed.set("crucible_scan_test_other:three", 3);
+        let _: () = seed.query_async(&mut conn).await.unwrap();
+
+        let manager = CacheInvalidationManager::new(
+            client,
+            CacheInvalidationConfig {
+                background_processing: false,
+                ..Default::default()
+            },
+        );
+        manager
+            .invalidate_pattern("crucible_scan_test:*")
+            .await
+            .unwrap();
+
+        let one: Option<i32> = conn.get("crucible_scan_test:one").await.unwrap();
+        let two: Option<i32> = conn.get("crucible_scan_test:two").await.unwrap();
+        let other: Option<i32> = conn.get("crucible_scan_test_other:three").await.unwrap();
+        assert!(one.is_none(), "matching key must be deleted");
+        assert!(two.is_none(), "matching key must be deleted");
+        assert_eq!(other, Some(3), "non-matching key must survive");
+
+        let _: () = redis::cmd("DEL")
+            .arg("crucible_scan_test_other:three")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_contract_footprint_deletes_only_matching_keys() {
+        let client = Arc::new(redis::Client::open("redis://127.0.0.1/").unwrap());
+        let mut conn = match client.get_multiplexed_async_connection().await {
+            Ok(conn) => conn,
+            Err(_) => return, // no local Redis available; nothing to verify
+        };
+
+        let sim_cache = SimulationCacheManager::new(client, 300);
+        sim_cache
+            .insert(
+                &SimulationCacheKey::new("CTR_SCAN_TEST", "transfer", "hash_1", 1),
+                SimulationResult {
+                    success: true,
+                    result_xdr: "AAAAAAA==".to_string(),
+                    cpu_instructions: 1,
+                    memory_bytes: 1,
+                    footprint: vec![],
+                },
+            )
+            .await;
+        sim_cache
+            .insert(
+                &SimulationCacheKey::new("CTR_OTHER_TEST", "transfer", "hash_2", 2),
+                SimulationResult {
+                    success: true,
+                    result_xdr: "BBBBBBB==".to_string(),
+                    cpu_instructions: 2,
+                    memory_bytes: 2,
+                    footprint: vec![],
+                },
+            )
+            .await;
+
+        sim_cache
+            .invalidate_contract_footprint("CTR_SCAN_TEST")
+            .await
+            .unwrap();
+
+        let matching: Option<String> = conn
+            .get("sim:CTR_SCAN_TEST:transfer:hash_1:1")
+            .await
+            .unwrap();
+        let other: Option<String> = conn
+            .get("sim:CTR_OTHER_TEST:transfer:hash_2:2")
+            .await
+            .unwrap();
+        assert!(
+            matching.is_none(),
+            "matching simulation key must be deleted"
+        );
+        assert!(other.is_some(), "non-matching simulation key must survive");
+
+        let _: () = redis::cmd("DEL")
+            .arg("sim:CTR_OTHER_TEST:transfer:hash_2:2")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn test_simulation_cache_hit_vs_miss_latency() {
         let client = Arc::new(redis::Client::open("redis://127.0.0.1/").unwrap());
-        let sim_cache = SimulationCacheManager::new(client, 300);
+        let sim_cache = SimulationCacheManager::new(client.clone(), 300);
+
+        // A previous run may have populated this key and it would still be
+        // inside its TTL, so start from a guaranteed cold cache.
+        if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
+            let _: redis::RedisResult<i64> = redis::cmd("DEL")
+                .arg("sim:C123456789:transfer:hash_abc_123:100500")
+                .query_async(&mut conn)
+                .await;
+        }
 
         let key = SimulationCacheKey::new("C123456789", "transfer", "hash_abc_123", 100500);
         let sim_res = SimulationResult {
