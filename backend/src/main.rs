@@ -167,7 +167,11 @@ async fn main() -> Result<(), anyhow::Error> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     let result = tokio::select! {
-        res = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()) => {
+        res = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal()) => {
             db_pool.close().await;
             res
         },
