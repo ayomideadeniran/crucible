@@ -147,6 +147,28 @@ pub async fn record_timeout(pool: &PgPool, run_id: Uuid, duration_ms: i64) -> Re
     Ok(())
 }
 
+/// Returns the start time of the most recent run for `job_name`, if any.
+///
+/// Used by the scheduler to detect ticks that were missed while no instance
+/// held the job's distributed lock, for example during a leader failover.
+pub async fn get_last_run_at(
+    pool: &PgPool,
+    job_name: &str,
+) -> Result<Option<DateTime<Utc>>, JobError> {
+    let last_run_at = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+        r#"
+        SELECT MAX(started_at)
+        FROM job_runs
+        WHERE job_name = $1
+        "#,
+    )
+    .bind(job_name)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(last_run_at)
+}
+
 /// Retrieves the most recent runs for a given job, ordered chronologically descending.
 pub async fn get_recent_runs(
     pool: &PgPool,
